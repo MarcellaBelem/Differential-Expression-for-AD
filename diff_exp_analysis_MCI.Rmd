@@ -1,0 +1,265 @@
+---
+title: "diff exp"
+output: html_notebook
+---
+
+```{r}
+library("dplyr")
+library("tidyverse")
+library("edgeR")
+library("EnhancedVolcano")
+library("ggpubr")
+library("ggplotify")
+library("stringr")
+library("org.Hs.eg.db")
+library("tidyr")
+```
+
+
+```{r}
+counts <- read.csv("tabela_counts164_new.csv", sep='\t', header=TRUE)
+
+clinical_data=read.delim2("dados_clinicos_164_plus.csv", sep=",")
+colnames(clinical_data)[colnames(clinical_data) == "Run"] = "id_samples"
+#clinical_data$GROUP= factor(clinical_data$GROUP, levels = c("CN", "MCI", "AD"))
+#clinical_data$SEX= factor(clinical_data$SEX, levels = c("M","F"))
+
+unique(clinical_data)
+#clinical_data=clinical_data[,-6] #remoção de coluna não necessaria
+```
+
+```{r}
+gene_description <- counts[,c("gene_id", "gene_name")] #lista com a descrição dos genes
+
+#counts[,c("Run", "SAMPLES", "GROUP", "AGE", "SEX")]
+rownames(counts) <- counts$gene_id #mudando o índice
+counts <- counts[,!(names(counts) %in% c("gene_id", "gene_name"))] #excluindo gene_name e gene_id
+sample_description= clinical_data[clinical_data$id_samples %in% colnames(counts), c("AGE", "SEX","id_samples", "GROUP")]
+#colnames(counts) <- gsub("[.]", "-", colnames(counts))
+```
+
+
+```{r, eval=FALSE, echo=FALSE}
+#case_samples_list <- clinical_data$Run #lista dos submitter_id
+#case_counts <- counts[, rownames(counts$Run) %in% case_samples_list] #counts com somente os presentes em clinical_data
+#table(clinical_data$primary_diagnosis)
+```
+```{r, eval=FALSE, echo=FALSE}
+clinical_data$pharm <- -9 #criando coluna pharm
+clinical_data$rad <- -9 #coluna rad
+
+clinical_data[clinical_data$treatments_pharmaceutical_treatment_or_therapy == "no", ]$pharm <- 0 
+clinical_data[clinical_data$treatments_pharmaceutical_treatment_or_therapy == "yes",]$pharm  <- 1 
+clinical_data[clinical_data$treatments_pharmaceutical_treatment_or_therapy == "not reported", ]$pharm <- 2
+
+clinical_data[clinical_data$treatments_radiation_treatment_or_therapy == "no", ]$rad <- 0
+clinical_data[clinical_data$treatments_radiation_treatment_or_therapy == "yes", ]$rad <- 1
+clinical_data[clinical_data$treatments_radiation_treatment_or_therapy == "not reported", ]$rad <- 2 #substituindo "não reportado" por 2
+
+#excluindo as colunas 
+clinical_data$treatments_pharmaceutical_treatment_or_therapy <- NULL 
+clinical_data$treatments_radiation_treatment_or_therapy <- NULL
+```
+
+```{r, eval=FALSE}
+counts=as.data.frame(t(counts))
+counts$id_samples <- rownames(counts)
+
+merge=merge(clinical_data[,c("id_samples", "GROUP")], counts, by.x = "id_samples", by.y = "id_samples")
+
+rownames(merge) <- merge$id_samples #mudando o índice
+counts_d <- merge[,!(names(merge) %in% c("id_samples", "GROUP"))] #excluindo gene_name e gene_id
+
+
+```
+
+
+```{r}
+#função para comparar os grupos
+compare_deg <- function(case1, case2){
+  
+  #separa os Run (samples) para cada grupo
+  tipo1.samples <- clinical_data[clinical_data$GROUP == "CN", ]$id_samples
+  tipo2.samples <- clinical_data[clinical_data$GROUP == "MCI", ]$id_samples
+  
+
+  #separa os tipos para os counts dos casos
+  tipo1 <- counts[, colnames(counts) %in% tipo1.samples]
+  tipo2 <- counts[, colnames(counts) %in% tipo2.samples]
+ 
+
+  mat <- cbind(tipo1, tipo2) #merge dos casos
+
+  #filtragem
+  keep.genes <- filterByExpr(mat, min.count = 5) #filterByExpr: mantém somente os counts com um número mínimo de amostras(min.10 counts)
+  mat <- mat[keep.genes, ] #mantem só as linhas que obedeceram o filtro
+  mat <- cpm(mat) #normalização: counts por milhão
+
+  tmat <- as.data.frame(t(mat)) #transposta
+  tmat$id_samples <- rownames(tmat) #criando coluna samples com os indices de tmat
+  tmat <- merge(tmat, clinical_data, by.x = "id_samples", by.y = "id_samples") #merge de tmat com os dados clínicos a partir da coluna id_samples(Run do ENA)
+  rownames(tmat) <- tmat$id_samples #os indices de tmat voltam a ser os samples
+  tmat$id_samples <- NULL #a coluna id_sample é excluida
+
+  exp <- t(tmat[, !(colnames(tmat) %in% colnames(clinical_data))])
+  #exp são os counts
+ # exp <- exp[-1,]
+  exp <- na.omit(exp)
+  
+  #matriz de covariaveis
+  cov <- tmat[, (colnames(tmat) %in% colnames(clinical_data))]
+  #cov$GROUP <- factor(c(rep("CN", 41), rep("MCI", 49), rep("AD", 74)))
+  cov$GROUP <- factor(cov$GROUP)
+  cov$SEX <- factor(cov$SEX, levels = c("M", "F"))
+
+#construindo a matrix de design que descreve as condições(covariaveis) do modelo
+  design_mat <- model.matrix(~cov$GROUP + cov$SEX + cov$AGE )
+
+#classe de dados DGEList que recebe os counts, os genes e os grupos
+#no nosso caso os subtipos de câncer de estômago
+  dgList <-DGEList(counts=exp, genes=rownames(exp), group= rownames(cov$GROUP))
+
+  #normalização
+  #transformação de distribuição
+  dgList <- calcNormFactors(dgList, method="TMM")
+  #TMM é a média ponderada 
+  
+  #teste de expressão diferencial
+  #estimateDisp: estimação das dispersões para cada gene
+  
+  #variabilidade geral em todo o genoma para este conjunto de dados
+  dgList <- estimateDisp(dgList, design=design_mat)
+ 
+  
+  #glm: modelo linear generalizado
+  #regressao linear - binomial negativa
+  #1. ajustando o modelo para os counts e as covariaveis
+  fit <- glmFit(dgList, design_mat)
+  
+  #2. teste de hipotese para ver se algum dos coeficientes (média de cada grupo) é diferente de zero
+  lrt <- glmLRT(fit, coef = 2) 
+  
+  #principais genes diferencialmente expressos classificados pelo p-valor
+  de_results <- topTags(lrt, adjust.method = "fdr", sort.by = "PValue", p.value = Inf, n = Inf)
+  de_results <- de_results$table
+
+  #Genome wide annotation for Human
+  #anotação dos genes a partir dos transcritos
+  #mapeando os ids, especificando as colunas symbol pelo ensembl
+  de_results$symbol <- mapIds(org.Hs.eg.db, rownames(de_results)<-gsub("\\..*","", rownames(de_results)), 
+                     column="SYMBOL", keytype = "ENSEMBL", multiVals="first")
+
+  
+  #criando uma coluna de keyvals que recebe uma cor para especificação de valor: regulado up, down e sem significância
+   keyvals <- ifelse((de_results$logFC < 0 & de_results$FDR <= 0.05), 'royalblue', 
+                     ifelse((de_results$logFC > 0 & de_results$FDR <= 0.05), 'gold', 'black'))
+  keyvals[is.na(keyvals)] <- 'black'
+  names(keyvals)[keyvals == 'gold'] <- 'Up-regulated'
+  names(keyvals)[keyvals == 'black'] <- 'No significance'
+  names(keyvals)[keyvals == 'royalblue'] <- 'Down-regulated'
+  
+  de_results$keyvals <- keyvals
+  
+  #contagem de ups, downs e notsig 
+  sum <- summary(de <- decideTests(object = lrt, adjust.method = "fdr", p.value = 0.05, lfc = 0))
+  sum <- data.frame(sum)
+  rownames(sum)[1] <- sprintf("%s_%s", case1, case2)
+  sum$down <- sum$Freq[1]
+  sum$NotSig <- sum$Freq[2]
+  sum$up <- sum$Freq[3]
+  sum <- sum[-(2:3),-(1:3)]
+  
+  #write.table(sum, file = sprintf("sumario/%s_%s_summary_CN_MCI.txt", case1, case2))
+  write.table(de_results, file = sprintf("Results/%s_%s_DEG.txt", case1, case2), quote = F, sep = "\t", row.names = F, eol = "\r")
+}
+```
+
+
+```{r}
+#CN= controle
+#MCI= comprometimento cognitivo leve
+#AD= Doença de alzheimer
+
+#sapply("CN", FUN=compare_deg, case2="AD")
+compare_deg("CN", "AD")
+#compare_deg("CN", "MCI")
+#compare_deg("MCI","AD")
+#table(clinical_data$GROUP)
+#unique(clinical_data)
+
+```
+
+```{r}
+volcano_plot <- function(file, name){
+  keyvals <- ifelse(file$logFC <= -2, 'royalblue', ifelse(file$logFC >= 2, 'gold', 'black'))
+  keyvals[is.na(keyvals)] <- 'black'
+  names(keyvals)[keyvals == 'gold'] <- 'Up-regulated'
+  names(keyvals)[keyvals == 'black'] <- 'No significance'
+  names(keyvals)[keyvals == 'royalblue'] <- 'Down-regulated'
+  
+  golds<- head(file %>% filter(file$keyvals == "gold"),5)
+  royalblues <- head(file %>% filter(file$keyvals=="royalblue"), 5)
+  
+  it_genes <- rbind(golds, royalblues)
+  file.genes <- file[file$symbol%in% it_genes$symbol,]
+    
+  v <- EnhancedVolcano(file, pointSize = 3, lab = file$symbol, selectLab = file.genes$symbol, x = 'logFC', y = 'FDR', axisLabSize = 10, pCutoff = 0.05, colCustom = keyvals, FCcutoff = 2, title="", subtitle = sprintf("%s", name), caption=" ", legendLabSize = 10, legendIconSize = 3, boxedLabels = TRUE, drawConnectors = TRUE,  widthConnectors = 1.0, colConnectors = 'black', max.overlaps = 100,  labSize = 4.0)
+  v <- ggplotGrob(v)
+  v
+}
+```
+
+
+```{r}
+
+
+files <- list.files("Results/", recursive=TRUE, full.names=TRUE)
+names <- list( "CN x AD", "CN x MCI", "MCI x AD")
+
+reader <- function(file){
+  df <- read.csv(file, sep='\t', header=TRUE)
+}
+
+myfilelist <- lapply(files, reader)
+
+plots <- mapply(myfilelist, names, FUN=volcano_plot)
+
+#par(mfrow= c(4,2))
+#volcano_plot(myfilelist[[1]], name=names[[1]])
+#volcano_plot(myfilelist[[2]], name=names[[2]])
+#volcano_plot(myfilelist[[3]], name=names[[3]])
+
+#par(mfrow= c(4,2)) 
+#plot(plots[[1]])
+#plot(plots[[2]])
+#plot(plots[[3]])
+#par(mfrow= c(1,1)) 
+
+ggarrange(plotlist = plots, nrow=1, labels="AUTO")
+```
+
+```{r}
+results= as.data.frame(de_results) #CN/mci
+EnhancedVolcano(results,
+                x="logFC",
+                y= "FDR", 
+                lab= rownames(results),
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                colCustom = keyvals,
+                pointSize = 3.0,
+                labSize = 4.0,
+                colAlpha = 1,
+                xlab = bquote(~Log[2]~ 'Fold Change'),
+                ylab = bquote(~-Log[10]~ 'p-value'),
+                legendPosition = 'right',
+                title= "CN vs MCI",
+                legendLabSize = 12,
+                legendIconSize = 4.0,
+                drawConnectors = TRUE,
+                widthConnectors = 0.5)
+?EnhancedVolcano
+```
+
+
+
